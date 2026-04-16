@@ -1,16 +1,4 @@
-"""
-Stock/Crypto Dashboard - Web API
-
-A simple FastAPI backend that serves the dashboard
-and provides API endpoints for ClickHouse data.
-
-Run with:
-    uvicorn src.production.dashboard.web_app:app --reload --port 8502
-
-Or:
-    python src/production/dashboard/web_app.py
-    python src/production/dashboard/web_app.py --crypto   # Crypto dashboard
-"""
+"""FastAPI backend for the real-time crypto market monitoring dashboard."""
 
 import argparse
 import asyncio
@@ -24,91 +12,86 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.responses import StreamingResponse
 
-# Parse command line arguments
 parser = argparse.ArgumentParser()
 parser.add_argument("--crypto", action="store_true", help="Use crypto dashboard")
 parser.add_argument("--port", type=int, default=8502, help="Port to run on")
 args, _ = parser.parse_known_args()
 
-# Dashboard mode (env var overrides CLI flag for Docker)
 DASHBOARD_MODE = os.environ.get("DASHBOARD_MODE", "crypto" if args.crypto else "stock")
-
-# =============================================================================
-# CLICKHOUSE CONNECTION
-# =============================================================================
+CLICKHOUSE_DATABASE = os.environ.get("CLICKHOUSE_DATABASE", "stocks")
+RAW_TABLE = os.environ.get("CLICKHOUSE_RAW_TABLE", "crypto_ticks_raw")
+METRICS_TABLE = os.environ.get("CLICKHOUSE_AGG_TABLE", "crypto_metrics_1m")
 
 client = None
 
 
 def get_client():
-    """Get or create ClickHouse client."""
     global client
     if client is None:
         client = clickhouse_connect.get_client(
             host=os.environ.get("CLICKHOUSE_HOST", "localhost"),
             port=int(os.environ.get("CLICKHOUSE_PORT", "8123")),
-            database="stocks",
+            database=CLICKHOUSE_DATABASE,
         )
     return client
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup and shutdown events."""
-    # Startup: initialize client
     get_client()
     yield
-    # Shutdown: close client
     global client
     if client:
         client.close()
 
 
-# =============================================================================
-# FASTAPI APP
-# =============================================================================
+app = FastAPI(title="Real-Time Crypto Market Monitor", lifespan=lifespan)
 
-app = FastAPI(
-    title="Real-Time Crypto Market Monitor",
-    lifespan=lifespan,
-)
-
-# Get the directory where this file is located
 DASHBOARD_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(DASHBOARD_DIR, "static")
+if os.path.isdir(STATIC_DIR):
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-# Mount static files
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-
-# =============================================================================
-# API ENDPOINTS
-# =============================================================================
+def _in_clause(symbols: str, prefix: str = "WHERE"):
+    symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    if not symbol_list:
+        return ""
+    joined = ", ".join([f"'{s}'" for s in symbol_list])
+    return f" {prefix} symbol IN ({joined})"
 
 
 @app.get("/")
 async def root():
-    """Serve the main dashboard page based on mode."""
-    if DASHBOARD_MODE == "crypto":
-        return FileResponse(os.path.join(STATIC_DIR, "crypto_index.html"))
-    return FileResponse(os.path.join(STATIC_DIR, "stock_index.html"))
+    crypto_index = os.path.join(STATIC_DIR, "crypto_index.html")
+    stock_index = os.path.join(STATIC_DIR, "stock_index.html")
+    if DASHBOARD_MODE == "crypto" and os.path.exists(crypto_index):
+        return FileResponse(crypto_index)
+    if os.path.exists(stock_index):
+        return FileResponse(stock_index)
+    return {
+        "message": "Crypto monitoring API is running.",
+        "endpoints": [
+            "/api/latest",
+            "/api/metrics/latest",
+            "/api/metrics/history",
+            "/api/overview",
+            "/api/alerts",
+        ],
+    }
 
 
 @app.get("/api/latest")
 async def get_latest_prices(symbols: str = ""):
-    """Get latest price for each symbol."""
-    symbol_filter = ""
-    if symbols:
-        symbol_list = ", ".join([f"'{s}'" for s in symbols.split(",")])
-        symbol_filter = f"WHERE symbol IN ({symbol_list})"
-
+    symbol_filter = _in_clause(symbols)
     query = f"""
     SELECT
         symbol,
-        argMax(price, timestamp) as price,
-        argMax(volume, timestamp) as volume,
-        max(timestamp) as last_update
-    FROM ticks
+        argMax(price, event_time) AS price,
+        argMax(volume, event_time) AS volume,
+        argMax(product_id, event_time) AS product_id,
+        max(event_time) AS last_update
+    FROM {RAW_TABLE}
     {symbol_filter}
     GROUP BY symbol
     ORDER BY symbol
@@ -119,7 +102,8 @@ async def get_latest_prices(symbols: str = ""):
             "symbol": row[0],
             "price": row[1],
             "volume": row[2],
-            "last_update": str(row[3]),
+            "product_id": row[3],
+            "last_update": str(row[4]),
         }
         for row in result.result_rows
     ]
@@ -127,59 +111,22 @@ async def get_latest_prices(symbols: str = ""):
 
 @app.get("/api/history")
 async def get_price_history(symbols: str = "", minutes: int = 60):
-    """Get price history for selected symbols."""
-    symbol_list = symbols.split(",") if symbols else []
-
+    symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
     if not symbol_list:
         return []
 
     symbols_str = ", ".join([f"'{s}'" for s in symbol_list])
-    time_filter = f"AND timestamp > now() - INTERVAL {minutes} MINUTE" if minutes > 0 else ""
-
     query = f"""
-    SELECT
-        timestamp,
-        symbol,
-        price
-    FROM ticks
+    SELECT event_time, symbol, price, volume
+    FROM {RAW_TABLE}
     WHERE symbol IN ({symbols_str})
-      {time_filter}
-    ORDER BY timestamp
+      AND event_time > now() - INTERVAL {minutes} MINUTE
+    ORDER BY event_time
     """
     result = get_client().query(query)
     return [
         {
-            "timestamp": str(row[0]),
-            "symbol": row[1],
-            "price": row[2],
-        }
-        for row in result.result_rows
-    ]
-
-
-@app.get("/api/recent")
-async def get_recent_ticks(symbols: str = "", limit: int = 20):
-    """Get most recent ticks."""
-    symbol_filter = ""
-    if symbols:
-        symbol_list = ", ".join([f"'{s}'" for s in symbols.split(",")])
-        symbol_filter = f"WHERE symbol IN ({symbol_list})"
-
-    query = f"""
-    SELECT
-        timestamp,
-        symbol,
-        price,
-        volume
-    FROM ticks
-    {symbol_filter}
-    ORDER BY timestamp DESC
-    LIMIT {limit}
-    """
-    result = get_client().query(query)
-    return [
-        {
-            "timestamp": str(row[0]),
+            "event_time": str(row[0]),
             "symbol": row[1],
             "price": row[2],
             "volume": row[3],
@@ -188,23 +135,23 @@ async def get_recent_ticks(symbols: str = "", limit: int = 20):
     ]
 
 
-@app.get("/api/stats")
-async def get_stats(symbols: str = ""):
-    """Get price statistics by symbol."""
-    symbol_filter = ""
-    if symbols:
-        symbol_list = ", ".join([f"'{s}'" for s in symbols.split(",")])
-        symbol_filter = f"WHERE symbol IN ({symbol_list})"
-
+@app.get("/api/metrics/latest")
+async def get_latest_metrics(symbols: str = ""):
+    symbol_filter = _in_clause(symbols)
     query = f"""
     SELECT
         symbol,
-        count() as tick_count,
-        round(min(price), 2) as min_price,
-        round(max(price), 2) as max_price,
-        round(avg(price), 2) as avg_price,
-        sum(volume) as total_volume
-    FROM ticks
+        argMax(product_id, window_end) AS product_id,
+        argMax(window_start, window_end) AS window_start,
+        max(window_end) AS window_end,
+        argMax(close_price, window_end) AS close_price,
+        argMax(return_pct_1m, window_end) AS return_pct_1m,
+        argMax(volatility_pct, window_end) AS volatility_pct,
+        argMax(total_volume, window_end) AS total_volume,
+        argMax(trade_count, window_end) AS trade_count,
+        argMax(is_price_spike, window_end) AS is_price_spike,
+        argMax(is_volume_anomaly, window_end) AS is_volume_anomaly
+    FROM {METRICS_TABLE}
     {symbol_filter}
     GROUP BY symbol
     ORDER BY symbol
@@ -213,86 +160,171 @@ async def get_stats(symbols: str = ""):
     return [
         {
             "symbol": row[0],
-            "tick_count": row[1],
-            "min_price": row[2],
-            "max_price": row[3],
-            "avg_price": row[4],
-            "total_volume": row[5],
+            "product_id": row[1],
+            "window_start": str(row[2]),
+            "window_end": str(row[3]),
+            "close_price": row[4],
+            "return_pct_1m": row[5],
+            "volatility_pct": row[6],
+            "total_volume": row[7],
+            "trade_count": row[8],
+            "is_price_spike": bool(row[9]),
+            "is_volume_anomaly": bool(row[10]),
         }
         for row in result.result_rows
     ]
 
 
-@app.get("/api/count")
-async def get_total_count(symbols: str = ""):
-    """Get total tick count."""
-    symbol_filter = ""
-    if symbols:
-        symbol_list = ", ".join([f"'{s}'" for s in symbols.split(",")])
-        symbol_filter = f"WHERE symbol IN ({symbol_list})"
+@app.get("/api/metrics/history")
+async def get_metrics_history(symbols: str = "", minutes: int = 60):
+    symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    if not symbol_list:
+        return []
 
-    result = get_client().query(f"SELECT count() FROM ticks {symbol_filter}")
-    return {"count": result.result_rows[0][0]}
+    symbols_str = ", ".join([f"'{s}'" for s in symbol_list])
+    query = f"""
+    SELECT
+        window_start,
+        window_end,
+        symbol,
+        close_price,
+        return_pct_1m,
+        volatility_pct,
+        total_volume,
+        trade_count,
+        is_price_spike,
+        is_volume_anomaly
+    FROM {METRICS_TABLE} FINAL
+    WHERE symbol IN ({symbols_str})
+      AND window_end > now() - INTERVAL {minutes} MINUTE
+    ORDER BY window_end
+    """
+    result = get_client().query(query)
+    return [
+        {
+            "window_start": str(row[0]),
+            "window_end": str(row[1]),
+            "symbol": row[2],
+            "close_price": row[3],
+            "return_pct_1m": row[4],
+            "volatility_pct": row[5],
+            "total_volume": row[6],
+            "trade_count": row[7],
+            "is_price_spike": bool(row[8]),
+            "is_volume_anomaly": bool(row[9]),
+        }
+        for row in result.result_rows
+    ]
+
+
+@app.get("/api/overview")
+async def get_overview():
+    query = f"""
+    WITH latest AS (
+        SELECT
+            symbol,
+            argMax(return_pct_1m, window_end) AS return_pct_1m,
+            argMax(volatility_pct, window_end) AS volatility_pct,
+            argMax(total_volume, window_end) AS total_volume,
+            argMax(is_price_spike, window_end) AS is_price_spike,
+            argMax(is_volume_anomaly, window_end) AS is_volume_anomaly
+        FROM {METRICS_TABLE}
+        GROUP BY symbol
+    )
+    SELECT
+        count() AS tracked_symbols,
+        sum(if(is_price_spike OR is_volume_anomaly, 1, 0)) AS active_alerts,
+        argMax(symbol, abs(return_pct_1m)) AS top_mover_symbol,
+        max(abs(return_pct_1m)) AS top_mover_return_pct,
+        argMax(symbol, volatility_pct) AS highest_vol_symbol,
+        max(volatility_pct) AS highest_volatility_pct,
+        sum(total_volume) AS total_volume_last_window
+    FROM latest
+    """
+    row = get_client().query(query).result_rows[0]
+    return {
+        "tracked_symbols": row[0],
+        "active_alerts": row[1],
+        "top_mover_symbol": row[2],
+        "top_mover_return_pct": row[3],
+        "highest_vol_symbol": row[4],
+        "highest_volatility_pct": row[5],
+        "total_volume_last_window": row[6],
+    }
+
+
+@app.get("/api/alerts")
+async def get_alerts(symbols: str = "", limit: int = 25):
+    symbol_filter = _in_clause(symbols, prefix="AND")
+    query = f"""
+    SELECT
+        window_end,
+        symbol,
+        close_price,
+        return_pct_1m,
+        volatility_pct,
+        total_volume,
+        is_price_spike,
+        is_volume_anomaly
+    FROM {METRICS_TABLE} FINAL
+    WHERE (is_price_spike = 1 OR is_volume_anomaly = 1)
+    {symbol_filter}
+    ORDER BY window_end DESC
+    LIMIT {limit}
+    """
+    result = get_client().query(query)
+    return [
+        {
+            "window_end": str(row[0]),
+            "symbol": row[1],
+            "close_price": row[2],
+            "return_pct_1m": row[3],
+            "volatility_pct": row[4],
+            "total_volume": row[5],
+            "is_price_spike": bool(row[6]),
+            "is_volume_anomaly": bool(row[7]),
+        }
+        for row in result.result_rows
+    ]
 
 
 @app.get("/api/symbols")
 async def get_symbols():
-    """Get list of all symbols."""
-    result = get_client().query("SELECT DISTINCT symbol FROM ticks ORDER BY symbol")
+    result = get_client().query(f"SELECT DISTINCT symbol FROM {RAW_TABLE} ORDER BY symbol")
     return [row[0] for row in result.result_rows]
-
-
-# =============================================================================
-# SSE - Real-time Stream
-# =============================================================================
-
-last_seen_timestamp = {}
 
 
 @app.get("/api/stream")
 async def stream_ticks(symbols: str = ""):
-    """Stream new ticks via Server-Sent Events."""
-
     async def event_generator():
         last_ts = None
         while True:
             try:
-                symbol_filter = ""
-                if symbols:
-                    symbol_list = ", ".join([f"'{s}'" for s in symbols.split(",")])
-                    symbol_filter = f"AND symbol IN ({symbol_list})"
-
-                ts_filter = ""
-                if last_ts:
-                    ts_filter = f"AND timestamp > '{last_ts}'"
-
+                symbol_filter = _in_clause(symbols, prefix="AND")
+                ts_filter = f" AND event_time > '{last_ts}'" if last_ts else ""
                 query = f"""
-                SELECT timestamp, symbol, price, volume
-                FROM ticks
+                SELECT event_time, symbol, price, volume
+                FROM {RAW_TABLE}
                 WHERE 1=1 {symbol_filter} {ts_filter}
-                ORDER BY timestamp DESC
+                ORDER BY event_time DESC
                 LIMIT 50
                 """
-                result = get_client().query(query)
-                rows = result.result_rows
-
+                rows = get_client().query(query).result_rows
                 if rows:
                     last_ts = str(rows[0][0])
-                    ticks = [
+                    payload = [
                         {
-                            "timestamp": str(r[0]),
+                            "event_time": str(r[0]),
                             "symbol": r[1],
                             "price": r[2],
                             "volume": r[3],
                         }
                         for r in reversed(rows)
                     ]
-                    yield f"data: {json.dumps(ticks)}\n\n"
-
-            except Exception as e:
-                yield f"data: {json.dumps({'error': str(e)})}\n\n"
-
-            await asyncio.sleep(0.5)
+                    yield f"data: {json.dumps(payload)}\n\n"
+            except Exception as exc:
+                yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+            await asyncio.sleep(1)
 
     return StreamingResponse(
         event_generator(),
@@ -301,10 +333,7 @@ async def stream_ticks(symbols: str = ""):
     )
 
 
-# =============================================================================
-# MAIN
-# =============================================================================
-
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8502)
+
+    uvicorn.run(app, host="0.0.0.0", port=args.port)

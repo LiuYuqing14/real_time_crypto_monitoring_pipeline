@@ -1,38 +1,33 @@
 services:
   # =============================================================================
-  # INFRASTRUCTURE (always start, no profile)
+  # INFRASTRUCTURE
   # =============================================================================
 
-  # Kafka - Message Broker
   kafka:
     image: apache/kafka:3.7.0
     container_name: kafka
     ports:
       - "9092:9092"
     environment:
-      # KRaft Mode (no Zookeeper)
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
 
-      # Listeners: INTERNAL (Docker) + EXTERNAL (host) + CONTROLLER
       KAFKA_LISTENERS: INTERNAL://:29092,EXTERNAL://:9092,CONTROLLER://:9093
       KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
       KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
 
-      # Single-node topic defaults
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
     healthcheck:
-      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || /opt/bitnami/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 8
 
-  # ClickHouse - Analytics Database
   clickhouse:
     image: clickhouse/clickhouse-server:24.1
     container_name: clickhouse
@@ -41,18 +36,20 @@ services:
       - "9000:9000"
     volumes:
       - clickhouse_data:/var/lib/clickhouse
+      - ./sql/clickhouse_init.sql:/docker-entrypoint-initdb.d/clickhouse_init.sql:ro
     environment:
+      CLICKHOUSE_DB: stocks
       CLICKHOUSE_USER: default
       CLICKHOUSE_PASSWORD: ""
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
     healthcheck:
-      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1'"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 8
 
   # =============================================================================
-  # PRODUCER (production - real-time crypto from Coinbase)
+  # PRODUCER
   # =============================================================================
 
   crypto-producer:
@@ -65,32 +62,14 @@ services:
         condition: service_healthy
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: crypto_ticks_raw
     profiles:
       - crypto
 
   # =============================================================================
-  # CONSUMERS (production - writes to ClickHouse)
+  # CONSUMER
   # =============================================================================
 
-  # Spark micro-batch consumer -> ClickHouse
-  spark-microbatch:
-    build:
-      context: ./src/production/consumer
-      dockerfile: Dockerfile.spark-consumer
-    container_name: spark-microbatch
-    depends_on:
-      kafka:
-        condition: service_healthy
-      clickhouse:
-        condition: service_healthy
-    environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      CLICKHOUSE_HOST: clickhouse
-      CLICKHOUSE_PORT: "8123"
-    profiles:
-      - spark_microbatch
-
-  # Spark streaming consumer (windowed aggregations) -> ClickHouse
   spark-streaming:
     build:
       context: ./src/production/consumer
@@ -103,8 +82,12 @@ services:
         condition: service_healthy
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC: crypto_ticks_raw
       CLICKHOUSE_HOST: clickhouse
       CLICKHOUSE_PORT: "8123"
+      CLICKHOUSE_DATABASE: stocks
+      CLICKHOUSE_RAW_TABLE: crypto_ticks_raw
+      CLICKHOUSE_AGG_TABLE: crypto_metrics_1m
       CHECKPOINT_DIR_RAW: /checkpoints/raw_ticks
       CHECKPOINT_DIR_AGG: /checkpoints/windowed_agg
     volumes:
@@ -116,26 +99,8 @@ services:
     profiles:
       - spark_streaming
 
-  # Flink consumer -> ClickHouse
-  flink-consumer:
-    build:
-      context: .
-      dockerfile: src/production/consumer/Dockerfile.flink-consumer
-    container_name: flink-consumer
-    depends_on:
-      kafka:
-        condition: service_healthy
-      clickhouse:
-        condition: service_healthy
-    environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      CLICKHOUSE_HOST: clickhouse
-      CLICKHOUSE_PORT: "8123"
-    profiles:
-      - flink
-
   # =============================================================================
-  # DASHBOARD (production - FastAPI web dashboard)
+  # DASHBOARD
   # =============================================================================
 
   web-dashboard:
@@ -149,15 +114,15 @@ services:
     environment:
       CLICKHOUSE_HOST: clickhouse
       CLICKHOUSE_PORT: "8123"
+      CLICKHOUSE_DATABASE: stocks
+      CLICKHOUSE_RAW_TABLE: crypto_ticks_raw
+      CLICKHOUSE_AGG_TABLE: crypto_metrics_1m
       DASHBOARD_MODE: ${DASHBOARD_MODE:-crypto}
     ports:
       - "8502:8502"
     profiles:
       - web
 
-# =============================================================================
-# VOLUMES
-# =============================================================================
 volumes:
   clickhouse_data:
   spark_checkpoints:
